@@ -109,10 +109,10 @@ const StudentDashboard: React.FC = () => {
     }
   };
 
-  // Helper function to update inventory in database and local state
-  const updateInventoryAndLocalState = async (menuItemId: string, quantityChange: number) => {
+  // Atomic operation to update inventory in database
+  const updateInventoryInDatabase = async (menuItemId: string, quantityChange: number) => {
     try {
-      // Get current quantity from database
+      // Use a database function or direct update with current value
       const { data: currentItem, error: fetchError } = await supabase
         .from('menu_items')
         .select('quantity_available')
@@ -123,30 +123,33 @@ const StudentDashboard: React.FC = () => {
 
       const newQuantity = Math.max(0, currentItem.quantity_available + quantityChange);
       
-      // Update the inventory in database
-      const { error: updateError } = await supabase
+      const { data: updatedItem, error: updateError } = await supabase
         .from('menu_items')
         .update({ quantity_available: newQuantity })
-        .eq('id', menuItemId);
+        .eq('id', menuItemId)
+        .select('*')
+        .single();
 
       if (updateError) throw updateError;
 
       console.log(`Inventory updated: Item ${menuItemId}, Change: ${quantityChange}, New Quantity: ${newQuantity}`);
       
-      // Update local state immediately to reflect the change
-      setMenuItems(prevItems => 
-        prevItems.map(item => 
-          item.id === menuItemId 
-            ? { ...item, quantity_available: newQuantity }
-            : item
-        )
-      );
-      
-      return newQuantity;
+      return updatedItem;
     } catch (error) {
       console.error('Error updating inventory:', error);
       throw error;
     }
+  };
+
+  // Update local menu items state with new inventory data
+  const updateLocalMenuItems = (updatedMenuItem: MenuItem) => {
+    setMenuItems(prevItems => 
+      prevItems.map(item => 
+        item.id === updatedMenuItem.id 
+          ? { ...item, quantity_available: updatedMenuItem.quantity_available }
+          : item
+      )
+    );
   };
 
   const addToCart = async (menuItem: MenuItem) => {
@@ -176,18 +179,23 @@ const StudentDashboard: React.FC = () => {
           return;
         }
         
-        // Update cart quantity first
+        // First update inventory
+        const updatedMenuItem = await updateInventoryInDatabase(menuItem.id, -1);
+        updateLocalMenuItems(updatedMenuItem);
+        
+        // Then update cart quantity
         const { error: cartError } = await supabase
           .from('cart_items')
           .update({ quantity: newQuantity })
           .eq('id', existingItem.id);
 
-        if (cartError) throw cartError;
+        if (cartError) {
+          // Rollback inventory change if cart update fails
+          await updateInventoryInDatabase(menuItem.id, 1);
+          throw cartError;
+        }
         
-        // Update inventory and local state
-        await updateInventoryAndLocalState(menuItem.id, -1);
-        
-        // Update cart items state
+        // Update local cart state
         setCartItems(prevItems => 
           prevItems.map(item => 
             item.id === existingItem.id 
@@ -197,6 +205,11 @@ const StudentDashboard: React.FC = () => {
         );
       } else {
         // Add new item to cart
+        // First update inventory
+        const updatedMenuItem = await updateInventoryInDatabase(menuItem.id, -1);
+        updateLocalMenuItems(updatedMenuItem);
+        
+        // Then add to cart
         const { data: newCartItem, error } = await supabase
           .from('cart_items')
           .insert({
@@ -210,12 +223,13 @@ const StudentDashboard: React.FC = () => {
           `)
           .single();
 
-        if (error) throw error;
+        if (error) {
+          // Rollback inventory change if cart insert fails
+          await updateInventoryInDatabase(menuItem.id, 1);
+          throw error;
+        }
         
-        // Update inventory and local state
-        await updateInventoryAndLocalState(menuItem.id, -1);
-        
-        // Add to cart items state
+        // Update local cart state
         setCartItems(prevItems => [...prevItems, newCartItem]);
       }
       
@@ -223,6 +237,8 @@ const StudentDashboard: React.FC = () => {
     } catch (error) {
       console.error('Error adding to cart:', error);
       showToast('Failed to add item to cart', 'error');
+      // Refresh menu items to ensure consistency
+      fetchMenuItems();
     } finally {
       setAddingToCart(null);
     }
@@ -241,17 +257,23 @@ const StudentDashboard: React.FC = () => {
 
       if (newQuantity <= 0) {
         // Remove item from cart completely
+        // First update inventory (return all quantity back)
+        const updatedMenuItem = await updateInventoryInDatabase(cartItem.menu_item_id, oldQuantity);
+        updateLocalMenuItems(updatedMenuItem);
+        
+        // Then remove from cart
         const { error } = await supabase
           .from('cart_items')
           .delete()
           .eq('id', cartItemId);
 
-        if (error) throw error;
+        if (error) {
+          // Rollback inventory change if cart delete fails
+          await updateInventoryInDatabase(cartItem.menu_item_id, -oldQuantity);
+          throw error;
+        }
         
-        // Return all quantity back to inventory
-        await updateInventoryAndLocalState(cartItem.menu_item_id, oldQuantity);
-        
-        // Remove from cart items state
+        // Update local cart state
         setCartItems(prevItems => prevItems.filter(item => item.id !== cartItemId));
         
         showToast('Item removed from cart', 'success');
@@ -268,18 +290,23 @@ const StudentDashboard: React.FC = () => {
           }
         }
 
-        // Update cart quantity in database
+        // First update inventory
+        const updatedMenuItem = await updateInventoryInDatabase(cartItem.menu_item_id, -quantityDifference);
+        updateLocalMenuItems(updatedMenuItem);
+
+        // Then update cart quantity in database
         const { error } = await supabase
           .from('cart_items')
           .update({ quantity: newQuantity })
           .eq('id', cartItemId);
 
-        if (error) throw error;
-
-        // Update inventory (negative quantityDifference means we're taking from inventory)
-        await updateInventoryAndLocalState(cartItem.menu_item_id, -quantityDifference);
+        if (error) {
+          // Rollback inventory change if cart update fails
+          await updateInventoryInDatabase(cartItem.menu_item_id, quantityDifference);
+          throw error;
+        }
         
-        // Update cart items state
+        // Update local cart state
         setCartItems(prevItems => 
           prevItems.map(item => 
             item.id === cartItemId 
@@ -291,6 +318,9 @@ const StudentDashboard: React.FC = () => {
     } catch (error) {
       console.error('Error updating cart quantity:', error);
       showToast('Failed to update cart', 'error');
+      // Refresh both menu and cart to ensure consistency
+      fetchMenuItems();
+      fetchCartItems();
     } finally {
       setUpdatingCart(null);
     }
