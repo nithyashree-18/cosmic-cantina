@@ -119,7 +119,14 @@ const StudentDashboard: React.FC = () => {
         .eq('id', menuItemId)
         .single();
 
-      if (fetchError) throw fetchError;
+      if (fetchError) {
+        // Check if the error is because the menu item doesn't exist
+        if (fetchError.code === 'PGRST116') {
+          console.log(`Menu item ${menuItemId} not found in database`);
+          return null; // Return null to indicate item not found
+        }
+        throw fetchError;
+      }
 
       const newQuantity = Math.max(0, currentItem.quantity_available + quantityChange);
       
@@ -130,7 +137,14 @@ const StudentDashboard: React.FC = () => {
         .select('*')
         .single();
 
-      if (updateError) throw updateError;
+      if (updateError) {
+        // Check if the error is because the menu item doesn't exist
+        if (updateError.code === 'PGRST116') {
+          console.log(`Menu item ${menuItemId} not found during update`);
+          return null; // Return null to indicate item not found
+        }
+        throw updateError;
+      }
 
       console.log(`Inventory updated: Item ${menuItemId}, Change: ${quantityChange}, New Quantity: ${newQuantity}`);
       
@@ -181,6 +195,15 @@ const StudentDashboard: React.FC = () => {
         
         // First update inventory
         const updatedMenuItem = await updateInventoryInDatabase(menuItem.id, -1);
+        
+        // Check if menu item was not found
+        if (updatedMenuItem === null) {
+          showToast('This item is no longer available. Please refresh the page.', 'error');
+          // Refresh menu items to get current state
+          fetchMenuItems();
+          return;
+        }
+        
         updateLocalMenuItems(updatedMenuItem);
         
         // Then update cart quantity
@@ -207,6 +230,15 @@ const StudentDashboard: React.FC = () => {
         // Add new item to cart
         // First update inventory
         const updatedMenuItem = await updateInventoryInDatabase(menuItem.id, -1);
+        
+        // Check if menu item was not found
+        if (updatedMenuItem === null) {
+          showToast('This item is no longer available. Please refresh the page.', 'error');
+          // Refresh menu items to get current state
+          fetchMenuItems();
+          return;
+        }
+        
         updateLocalMenuItems(updatedMenuItem);
         
         // Then add to cart
@@ -259,17 +291,25 @@ const StudentDashboard: React.FC = () => {
         // Remove item from cart completely
         // First update inventory (return all quantity back)
         const updatedMenuItem = await updateInventoryInDatabase(cartItem.menu_item_id, oldQuantity);
-        updateLocalMenuItems(updatedMenuItem);
         
-        // Then remove from cart
+        // Check if menu item was not found - still proceed with cart removal
+        if (updatedMenuItem === null) {
+          console.log('Menu item not found during cart removal, proceeding with cart cleanup');
+        } else {
+          updateLocalMenuItems(updatedMenuItem);
+        }
+        
+        // Remove from cart
         const { error } = await supabase
           .from('cart_items')
           .delete()
           .eq('id', cartItemId);
 
         if (error) {
-          // Rollback inventory change if cart delete fails
-          await updateInventoryInDatabase(cartItem.menu_item_id, -oldQuantity);
+          // Only rollback if we successfully updated inventory
+          if (updatedMenuItem !== null) {
+            await updateInventoryInDatabase(cartItem.menu_item_id, -oldQuantity);
+          }
           throw error;
         }
         
@@ -281,7 +321,15 @@ const StudentDashboard: React.FC = () => {
         // Check if we have enough inventory for the increase
         if (quantityDifference > 0) {
           const currentMenuItem = menuItems.find(item => item.id === cartItem.menu_item_id);
-          if (!currentMenuItem) return;
+          if (!currentMenuItem) {
+            showToast('This item is no longer available. Removing from cart.', 'error');
+            // Remove the cart item since the menu item doesn't exist
+            setCartItems(prevItems => prevItems.filter(item => item.id !== cartItemId));
+            // Remove from database
+            await supabase.from('cart_items').delete().eq('id', cartItemId);
+            setUpdatingCart(null);
+            return;
+          }
 
           if (quantityDifference > currentMenuItem.quantity_available) {
             showToast(`Only ${currentMenuItem.quantity_available} more items available`, 'error');
@@ -292,6 +340,18 @@ const StudentDashboard: React.FC = () => {
 
         // First update inventory
         const updatedMenuItem = await updateInventoryInDatabase(cartItem.menu_item_id, -quantityDifference);
+        
+        // Check if menu item was not found
+        if (updatedMenuItem === null) {
+          showToast('This item is no longer available. Removing from cart.', 'error');
+          // Remove the cart item since the menu item doesn't exist
+          setCartItems(prevItems => prevItems.filter(item => item.id !== cartItemId));
+          // Remove from database
+          await supabase.from('cart_items').delete().eq('id', cartItemId);
+          setUpdatingCart(null);
+          return;
+        }
+        
         updateLocalMenuItems(updatedMenuItem);
 
         // Then update cart quantity in database
